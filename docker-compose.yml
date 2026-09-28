@@ -1,0 +1,33 @@
+services:
+  app:
+    build: .
+    container_name: goal-architect
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - DSH_HOME=/app/work/dsh-home
+    volumes:
+      - dsh-home:/app/work/dsh-home
+    # 过渡期临时对公网开放,方便服务器恢复后先用 http://IP:3001 验证。
+    # Cloudflare Tunnel 配通后,把这行改成不映射(由隧道接入),避免明文暴露。
+    ports:
+      - "0.0.0.0:3001:3001"
+    expose:
+      - "3001"
+
+  # Cloudflare Tunnel: 把容器内 http://app:3001 经加密隧道接到 nobomimi.cn (自动 HTTPS)
+  # 不再需要 Caddy / 80-443 端口 / DNS A 记录。
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: goal-architect-tunnel
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    environment:
+      # 在 Cloudflare 后台创建 tunnel 后获取 (形如 eyJhIjoi... 一长串)
+      - TUNNEL_TOKEN=${TUNNEL_TOKEN}
+    depends_on:
+      - app
+
+volumes:
+  dsh-home:

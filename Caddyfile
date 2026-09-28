@@ -1,0 +1,17 @@
+{
+	admin off
+}
+
+# SITE_ADDRESS is injected from the .env file (e.g. goal.example.com)
+{$SITE_ADDRESS} {
+	encode gzip
+
+	# SSE streaming endpoint used by the agent.
+	# flush_interval -1 disables buffering so event-stream chunks
+	# are pushed to the client immediately.
+	reverse_proxy app:3001 {
+		flush_interval -1
+		header_up X-Forwarded-Proto {scheme}
+		header_up X-Forwarded-Host {host}
+	}
+}
