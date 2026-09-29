@@ -6,6 +6,7 @@ import { makeTraceSink, type TraceSink } from "@/lib/trace";
 
 type ChatMessage = { role: "user" | "assistant"; content: string };
 type JsonRpcMessage = { id?: number; result?: unknown; error?: { message?: string }; method?: string; params?: Record<string, unknown> };
+type FailureDetail = { message?: string; code?: string; status?: number };
 
 const systemPrompt = `You are Goal Architect, a professional learning and goal-planning researcher. Your job is to turn a vague goal into a personalized, verifiable learning plan — not a generic list of advice.
 
@@ -73,10 +74,39 @@ function promptFor(state: GoalState, messages: ChatMessage[], action: "message" 
   return `${systemPrompt}\n\nCurrent goal state:\n${JSON.stringify(state)}\n\nCurrent roadmap:\n${JSON.stringify(roadmap || [])}\n\nConversation so far:\n${messages.map((m) => `${m.role}: ${m.content}`).join("\n")}\n\nAction: ${planningProtocol}\n${revisionProtocol}\nReturn only JSON.`;
 }
 
+// When the upstream model call fails, dsh hides the reason inside the attempt
+// stream: data.stream[].chunk.type === "finish" with reason.kind === "error".
+// Reading it out keeps an HTTP failure from collapsing into a meaningless
+// "empty response" later on.
+function failureFromAttempt(data: any): FailureDetail | null {
+  const stream = Array.isArray(data?.stream) ? data.stream : [];
+  for (const entry of stream) {
+    const chunk = entry?.chunk;
+    if (chunk?.type !== "finish") continue;
+    const reason = chunk.reason;
+    if (reason?.kind !== "error") continue;
+    const detail = reason.failure || reason.error;
+    return detail ? { message: detail.message, code: detail.code, status: detail.status } : { message: "unknown error" };
+  }
+  return null;
+}
+
+function failureFromReason(reason: any): FailureDetail | null {
+  if (reason?.kind !== "error") return null;
+  const detail = reason.failure || reason.error;
+  return detail ? { message: detail.message, code: detail.code, status: detail.status } : { message: "unknown error" };
+}
+
+function describeFailure(failure: FailureDetail): string {
+  const parts = [failure.message, failure.code, failure.status ? `HTTP ${failure.status}` : undefined].filter(Boolean);
+  return parts.join(" · ") || "未知上游错误";
+}
+
 export async function callDshAgent(state: GoalState, messages: ChatMessage[], action: "message" | "plan" | "revise", roadmap: RoadmapStep[] | null = null, trace?: TraceSink, signal?: AbortSignal): Promise<AgentReply> {
   const { command, args } = argsFromEnvironment();
   const emit = makeTraceSink(trace);
   const sessionId = `goal-${randomUUID()}`;
+  let lastFailure: FailureDetail | null = null;
   let cancelled = false;
   emit("stage", "启动 DeepSeek Harness", `${command} ${args.join(" ")}`, "running", "launch");
   const child = spawn(command, args, {
@@ -126,10 +156,17 @@ export async function callDshAgent(state: GoalState, messages: ChatMessage[], ac
           const resultCallId = data.callId || (data.message as { callId?: string } | undefined)?.callId || "result";
           emit("tool", failed ? "工具返回错误" : "工具返回结果", failed ? "工具调用未成功" : "结果已回传给模型", failed ? "failed" : "done", `tool-${String(resultCallId)}`);
         } else if (eventType === "assistant/message") emit("model", "模型完成一轮输出", "已收到模型公开输出，继续检查后续步骤", "done", `step-${String(data.turn || "")}-${String(data.step || "")}`);
-        else if (eventType === "assistant/attempt") emit("model", "模型尝试结束", "记录了一次模型请求结果", "done", `attempt-${String(data.turn || "")}-${String(data.step || "")}`);
+        else if (eventType === "assistant/attempt") {
+          const failure = failureFromAttempt(data);
+          if (failure) {
+            lastFailure = failure;
+            emit("error", "模型请求失败", describeFailure(failure), "failed", `attempt-${String(data.turn || "")}-${String(data.step || "")}`);
+          } else emit("model", "模型尝试结束", "记录了一次模型请求结果", "done", `attempt-${String(data.turn || "")}-${String(data.step || "")}`);
+        }
         else if (eventType === "turn/end") {
           const reason = data.reason as { kind?: string } | undefined;
-          emit("stage", reason?.kind === "completed" ? "任务轮次完成" : "任务轮次结束", reason?.kind ? `状态：${reason.kind}` : undefined, reason?.kind === "completed" ? "done" : "failed", `turn-${String(data.turn || "")}`);
+          lastFailure = lastFailure || failureFromReason(reason);
+          emit("stage", reason?.kind === "completed" ? "任务轮次完成" : "任务轮次结束", reason?.kind === "error" && lastFailure ? describeFailure(lastFailure) : reason?.kind ? `状态：${reason.kind}` : undefined, reason?.kind === "completed" ? "done" : "failed", `turn-${String(data.turn || "")}`);
         } else if (eventType === "request/header") {
           const header = data.header as { tools?: Array<{ name?: string }> } | undefined;
           const count = header?.tools?.length;
@@ -228,7 +265,11 @@ export async function callDshAgent(state: GoalState, messages: ChatMessage[], ac
     emit("stage", action === "plan" || action === "revise" ? "进入 Research 阶段" : "处理 Discovery 对话", action === "plan" || action === "revise" ? "将按路线步骤搜索并核验公开资源" : "正在提取 Goal State", "done", "session");
 
     await waitForIdle();
-    if (!finalText) throw new Error("DeepSeek Harness returned an empty response");
+    if (!finalText) {
+      throw new Error(lastFailure
+        ? `DeepSeek 请求失败：${describeFailure(lastFailure)}`
+        : "DeepSeek Harness returned an empty response");
+    }
     if (action === "plan" || action === "revise") emit("model", "Thinking · 深度规划", "正在综合用户约束，检查每个步骤的任务、资源和工具是否一一对应", "running", "deep-planning");
     const parseCandidates = () => {
       let parsed: AgentReply | undefined;

@@ -80,7 +80,18 @@ export default function Home() {
   const lastAssistantIndex = messages.reduce((latest, message, index) => message.role === "assistant" ? index : latest, -1);
 
   useEffect(() => {
-    if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    const node = scrollRef.current;
+    if (!node) return;
+    // Follow the first ancestor that genuinely owns a scrollbar, but stop before the
+    // column: binding its scroll would drag the heading out of view.
+    let target: HTMLElement | null = node;
+    while (target) {
+      const overflowY = window.getComputedStyle(target).overflowY;
+      if ((overflowY === "auto" || overflowY === "scroll") && target.scrollHeight > target.clientHeight + 1) break;
+      if (target.classList.contains("chat-column")) { target = null; break; }
+      target = target.parentElement;
+    }
+    if (target) target.scrollTop = target.scrollHeight;
   }, [messages, busy]);
 
   useEffect(() => {
@@ -389,7 +400,7 @@ export default function Home() {
         <div className="topbar-actions"><button className="theme-toggle" type="button" onClick={toggleTheme} aria-label={`切换到${theme === "light" ? "深色" : "浅色"}主题`}><span className={theme === "light" ? "active" : ""}><Sun size={13} /></span><span className={theme === "dark" ? "active" : ""}><Moon size={13} /></span></button><button className="new-project-button" type="button" onClick={startNewProject}><Plus size={13} /> 新项目</button></div>
       </header>
 
-      <div ref={shellRef} className={`app-shell ${roadmap ? "has-roadmap" : ""}`}>
+      <div ref={shellRef} className={`app-shell ${roadmap ? "has-roadmap" : ""} ${messages.length > 1 ? "has-conversation" : ""}`}>
         <section className="chat-column">
           <div className="workspace-heading">
             <div className="eyebrow"><Sparkles size={13} /> YOUR PERSONAL PATHFINDER</div>
@@ -540,10 +551,61 @@ function RoadmapDirectory({ roadmap, selected, onSelect }: { roadmap: RoadmapSte
   </nav>;
 }
 
+const WEEKS_PER_MONTH = 4.345;
+const PARALLEL_HINT = /并行|同时|重叠|同期/;
+
+type DurationParse =
+  | { type: "span"; start: number; end: number; months: boolean }
+  | { type: "effort"; weeks: number; parallel: boolean };
+
+// The model writes durations in several shapes: absolute windows
+// ("第 1–4 周", "第 5-9 个月（约 20 周）· 每周约 6 小时") or bare per-step effort
+// ("12 周（与步骤 1、3、4 并行）"). Accept every shape so 完成周期 only falls back
+// to 待定 when there is genuinely nothing readable.
+function parseDuration(duration: string): DurationParse | null {
+  const text = duration || "";
+  const parallel = PARALLEL_HINT.test(text);
+  const weekRange = text.match(/第\s*(\d+)\s*[–—-]\s*(\d+)\s*周/);
+  if (weekRange) return { type: "span", start: Number(weekRange[1]), end: Number(weekRange[2]), months: false };
+  const monthRange = text.match(/第\s*(\d+)\s*[–—-]\s*(\d+)\s*个?月/);
+  if (monthRange) return { type: "span", start: Math.round(Number(monthRange[1]) * WEEKS_PER_MONTH), end: Math.round(Number(monthRange[2]) * WEEKS_PER_MONTH), months: true };
+  const monthSingle = text.match(/第\s*(\d+)\s*个?月/);
+  if (monthSingle) { const weeks = Math.round(Number(monthSingle[1]) * WEEKS_PER_MONTH); return { type: "span", start: weeks, end: weeks, months: true }; }
+  const weekSingle = text.match(/第\s*(\d+)\s*周/);
+  if (weekSingle) { const weeks = Number(weekSingle[1]); return { type: "span", start: weeks, end: weeks, months: false }; }
+  const bareWeeks = text.match(/(\d+(?:\.\d+)?)\s*周/);
+  if (bareWeeks) return { type: "effort", weeks: Math.round(Number(bareWeeks[1])), parallel };
+  const bareMonths = text.match(/(\d+(?:\.\d+)?)\s*个?月/);
+  if (bareMonths) return { type: "effort", weeks: Math.round(Number(bareMonths[1]) * WEEKS_PER_MONTH), parallel };
+  return null;
+}
+
 function RoadmapOverview({ roadmap }: { roadmap: RoadmapStep[] }) {
   const resourceCount = roadmap.reduce((total, step) => total + (Array.isArray(step.resources) ? step.resources.length : 0), 0);
-  const weekRanges = roadmap.flatMap((step) => [...(step.duration || "").matchAll(/第\s*(\d+)\s*[–—-]\s*(\d+)\s*周/g)].map((match) => ({ start: Number(match[1]), end: Number(match[2]) })));
-  const cycle = weekRanges.length ? `${Math.min(...weekRanges.map((range) => range.start))}–${Math.max(...weekRanges.map((range) => range.end))}周` : "待定";
+  const parsed = roadmap.flatMap((step) => { const value = parseDuration(step.duration); return value ? [value] : []; });
+  let cycle = "待定";
+  const spans = parsed.flatMap((value) => (value.type === "span" ? [value] : []));
+  if (spans.length) {
+    // Absolute windows: the cycle is just the earliest start to the latest end.
+    const start = Math.min(...spans.map((span) => span.start));
+    const end = Math.max(...spans.map((span) => span.end));
+    const monthMode = spans.filter((span) => span.months).length * 2 >= spans.length;
+    cycle = monthMode
+      ? `${Math.max(1, Math.round(start / WEEKS_PER_MONTH))}–${Math.max(1, Math.round(end / WEEKS_PER_MONTH))}个月`
+      : `${start}–${end}周`;
+  } else {
+    // Bare per-step effort: add the sequential steps, and skip anything the
+    // model marked as running in parallel so it is not double counted.
+    const efforts = parsed.flatMap((value) => (value.type === "effort" ? [value] : []));
+    if (efforts.length) {
+      const longest = Math.max(...efforts.map((effort) => effort.weeks));
+      const sequential = efforts.filter((effort) => !effort.parallel);
+      const total = sequential.length
+        ? Math.max(sequential.reduce((sum, effort) => sum + effort.weeks, 0), longest)
+        : longest;
+      cycle = `约 ${total} 周`;
+    }
+  }
   return <div className="route-overview"><div><strong>{roadmap.length}</strong><span>阶段</span></div><div><strong>{resourceCount}</strong><span>已核验资源</span></div><div><strong>{cycle}</strong><span>完成周期</span></div></div>;
 }
 
